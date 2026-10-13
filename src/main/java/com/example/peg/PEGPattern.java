@@ -276,16 +276,19 @@ abstract class Action implements Expr {
 final class VarAction extends Action {
     final String n;
     final String kind;
+    final List<Expr> args;
 
-    VarAction(String n, String k) {
+    VarAction(String n, String kind, List<Expr> args) {
         this.n = n;
-        kind = k;
+        this.kind = kind;
+        this.args = args;
     }
 
     Object run(Context c) {
         Object v = switch (kind) {
             case "dict" -> new Dictionary();
             case "list" -> new Array();
+            case "eval" -> new Eval((String) args.getFirst().eval(c).value());
             default -> throw new IllegalArgumentException("Undefined variable: " + kind);
         };
         c.bind(n, v);
@@ -508,10 +511,8 @@ final class GrammarParser {
             skip();
             expect('=');
             String fn = ident();
-            skip();
-            expect('(');
-            expect(')');
-            return new VarAction(n, fn);
+            List<Expr> args = args();
+            return new VarAction(n, fn, args);
         }
         // return actionExpr
         if (match("return")) {
@@ -535,10 +536,18 @@ final class GrammarParser {
             throw new GrammarCompileException("Only indexed assignment supported");
         }
         // <ident> . <ident> ( <args> )
+        // <ident> . <ident> = <actionExpr>
         if (match(".")) {
             String method = ident();
-            List<Expr> args = args();
-            return new MethodAction(new NameValue(lhs), method, args);
+            skip();
+            // 属性设置或者方法调用
+            if (match("=")) {
+                Expr e = actionExpr();
+                return new MethodAction(new NameValue(lhs), ":" + method, List.of(e));
+            } else {
+                List<Expr> args = args();
+                return new MethodAction(new NameValue(lhs), method, args);
+            }
         }
         throw new GrammarCompileException("Invalid action at " + p);
     }
@@ -579,9 +588,15 @@ final class GrammarParser {
         skip();
         // 方法调用
         if (match(".")) {
-            String m = ident();
-            List<Expr> a = args();
-            return new MethodAction(new NameValue(n), m, a);
+            String method = ident();
+            skip();
+            // 属性获取或者方法调用
+            if (peek('(')) {
+                List<Expr> args = args();
+                return new MethodAction(new NameValue(n), method, args);
+            } else {
+                return new MethodAction(new NameValue(n), ":" + method, Collections.emptyList());
+            }
         }
         // 对象索引
         if (match("[")) {

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
 import java.math.MathContext;
+import java.text.MessageFormat;
 import java.util.*;
 import java.util.function.BiFunction;
 
@@ -136,4 +137,21 @@ class EngineTest {
         assertEquals(1, m.error().line());
         assertEquals(1, m.error().column());
     }
+
+    @Test
+    void eval() {
+        String g = """
+                student = { var stu=eval('com.example.peg.Student') } "name=" name ", age=" age { slot['stu']=stu.say() }
+                name = '"' (?<n>[a-zA-Z]+) '"' { stu.name=n }
+                age = (?<a>[0-9]+) { stu.age=stu.parseInt(a) }
+                """;
+        PEGMatcher matcher = PEGPattern.compile(g).matcher("""
+                name="xh", age=100
+                """);
+        assertTrue(matcher.matches());
+        Object stu = matcher.slot("stu");
+        assertNotNull(stu);
+        assertEquals("name=xh, age=100", stu);
+    }
+
 }

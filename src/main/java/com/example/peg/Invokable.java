@@ -20,7 +20,7 @@ public interface Invokable {
         }
     }
 
-    private boolean isInstance(Class<?> type, Object value) {
+    default boolean isInstance(Class<?> type, Object value) {
         if (type.isPrimitive()) {
             return isInstance(wrapPrimitiveType(type), value);
         } else {
