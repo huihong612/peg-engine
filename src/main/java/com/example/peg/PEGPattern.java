@@ -252,11 +252,14 @@ record RuleRefExpr(String n) implements Expr {
     }
 }
 
-record Capture(String name, Expr e) implements Expr {
+record Capture(String name, Expr e, boolean out) implements Expr {
 
     public Result eval(Context c) {
         Result r = e.eval(c);
-        if (r.success()) c.bind(name, r.value());
+        if (r.success()) {
+            c.bind(name, r.value());
+            if (out) c.returnValue = r.value();
+        }
         return r;
     }
 }
@@ -454,6 +457,8 @@ final class GrammarParser {
         if (match("(")) {
             skip();
             if (match("?<")) {
+                skip();
+                boolean out = match("out");
                 String n = ident();
                 skip();
                 expect('>');
@@ -461,7 +466,7 @@ final class GrammarParser {
                 Expr e = choice();
                 skip();
                 expect(')');
-                return new Capture(n, e);
+                return new Capture(n, e, out);
             }
             Expr e = choice();
             expect(')');

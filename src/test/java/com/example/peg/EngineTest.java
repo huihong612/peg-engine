@@ -30,7 +30,7 @@ class EngineTest {
 
     @Test
     void captureAndReturn() {
-        var p = PEGPattern.compile("number = (?<num>[0-9]+) { return num }");
+        var p = PEGPattern.compile("number = (?<out num>[0-9]+)");
         PEGMatcher matcher = p.matcher("123");
         assertTrue(matcher.matches());
     }
@@ -71,12 +71,12 @@ class EngineTest {
     @Test
     void recursiveJson() {
         String g = """
-                value = (?<r>object / array / string / number) { slot['r'] = r ; return r }
+                value = (?<out r>object / array / string / number) { slot['r'] = r }
                 object = { var obj = dict() } "{" (pair ("," pair)*)? "}" { return obj }
                 pair = (?<k>string) ":" (?<v>value) { obj[k] = v }
                 array = { var arr = list() } "[" ((?<v>value) { arr.push(v) } ("," (?<v>value) { arr.push(v) })*)? "]" { return arr }
-                string = '"' (?<v>[^"]*) '"' {return v}
-                number = (?<v>[0-9]+){ return v }
+                string = '"' (?<out v>[^"]*) '"'
+                number = (?<out v>[0-9]+)
                 """;
         var m = PEGPattern.compile(g).matcher("""
                 {"a":1,"b":[2,3]}
