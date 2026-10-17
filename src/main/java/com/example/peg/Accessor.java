@@ -5,229 +5,272 @@ import java.beans.IntrospectionException;
 import java.beans.Introspector;
 import java.beans.PropertyDescriptor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 public class Accessor {
 
-    private static final Map<Class<?>, TypeMeta> TYPE_CACHE = new ConcurrentHashMap<>();
+    private final Object target;
+    private final Map<String, Property> properties;
+    private final Map<String, List<Method>> methods;
 
-    private static final String GET_METHOD = "get";
-    private static final String SET_METHOD = "set";
+    public Accessor(Object target, Class<?> type) {
+        this.target = Objects.requireNonNull(target, "target");
+        Objects.requireNonNull(type, "type");
 
-    private static TypeMeta getTypeMeta(Class<?> type) {
-        TypeMeta cache = TYPE_CACHE.get(type);
-        if (cache != null) {
-            return cache;
+        if (!type.isInstance(target)) {
+            throw new IllegalArgumentException(
+                    "Target of type " + target.getClass().getName() + " is not an instance of " + type.getName()
+            );
         }
-        TypeMeta typeMeta = new TypeMeta(type);
-        TYPE_CACHE.put(type, typeMeta);
-        return typeMeta;
+
+        // Public fields take precedence over JavaBean properties.
+        Map<String, Property> propertyMap = Arrays.stream(type.getFields())
+                .collect(Collectors.toMap(Field::getName, FieldProperty::new, (first, second) -> first));
+
+        Arrays.stream(getBeanInfo(type).getPropertyDescriptors())
+                .forEach(it -> propertyMap.putIfAbsent(it.getName(), new MethodProperty(it)));
+
+        this.properties = Map.copyOf(propertyMap);
+
+        this.methods = Arrays.stream(type.getMethods())
+                .filter(method -> !method.isBridge())
+                .filter(method -> !method.isSynthetic())
+                .collect(Collectors.groupingBy(Method::getName));
     }
 
-    /**
-     * 设置对象属性值
-     */
-    public static void setProperty(Object target, String property, Object value) {
-        if (target == null || property == null) {
-            throw new IllegalArgumentException("Object and property cannot be null");
-        }
-
-        TypeMeta typeMeta = getTypeMeta(target.getClass());
+    private static BeanInfo getBeanInfo(Class<?> type) {
         try {
-            typeMeta.setProperty(target, property, value);
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalArgumentException("Failed to set property: " + property, e);
+            return Introspector.getBeanInfo(type, Object.class);
+        } catch (IntrospectionException e) {
+            throw new IllegalArgumentException("Failed to inspect type: " + type.getName(), e);
         }
     }
 
-    /**
-     * 获取对象属性值
-     */
-    public static Object getProperty(Object target, String property) {
-        if (target == null || property == null) {
-            throw new IllegalArgumentException("Object and property cannot be null");
+    private Property lookupProperty(String name) {
+        Property property = properties.get(name);
+
+        if (property == null) {
+            throw new IllegalArgumentException("No such property: " + name);
         }
 
-        TypeMeta typeMeta = getTypeMeta(target.getClass());
+        return property;
+    }
+
+    public void set(String name, Object value) {
+        lookupProperty(name).set(target, value);
+    }
+
+    public Object get(String name) {
+        return lookupProperty(name).get(target);
+    }
+
+    public Object call(String name, Object... args) {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(args, "args");
+
+        Method method = lookupMethod(name, args);
+
         try {
-            return typeMeta.getProperty(target, property);
+            return method.invoke(target, args);
+        } catch (InvocationTargetException e) {
+            throw propagateTargetException("Target method failed: " + name, e);
         } catch (ReflectiveOperationException e) {
-            throw new IllegalArgumentException("Failed to get property: " + property, e);
+            throw new AccessorException("Failed to invoke method: " + name, e);
+        } catch (IllegalArgumentException e) {
+            throw new AccessorException("Invalid arguments for method: " + name, e);
         }
     }
 
-    /**
-     * 通过索引设置值
-     */
-    public static void setIndex(Object target, Object[] indexes, Object value) {
-        if (target == null || indexes == null) {
-            throw new IllegalArgumentException("Object and index cannot be null");
+    private Method lookupMethod(String name, Object[] args) {
+        List<Method> candidates = methods.get(name);
+
+        if (candidates == null || candidates.isEmpty()) {
+            throw new IllegalArgumentException("No such method: " + name);
         }
 
-        TypeMeta typeMeta = getTypeMeta(target.getClass());
-        try {
-            typeMeta.setIndex(target, indexes, value);
-        } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Failed to set index", e);
+        // Phase 1: exact runtime type matching.
+        Method method = findUnique(candidates, candidate -> isExactMatch(candidate, args), name);
+
+        if (method != null) {
+            return method;
+        }
+
+        // Phase 2: compatible reference types and boxing matches.
+        method = findUnique(candidates, candidate -> isCompatibleMatch(candidate, args), name);
+
+        if (method != null) {
+            return method;
+        }
+
+        throw new IllegalArgumentException("No matching method: " + name + " with " + args.length + " argument(s)");
+    }
+
+    private static Method findUnique(List<Method> candidates, Predicate<Method> predicate, String name) {
+        List<Method> matches = candidates.stream().filter(predicate).toList();
+
+        if (matches.size() > 1) {
+            String signatures = matches.stream().map(Method::toGenericString).collect(Collectors.joining(", "));
+            throw new IllegalArgumentException("Ambiguous method: " + name + ". Candidates: " + signatures);
+        }
+
+        return matches.isEmpty() ? null : matches.getFirst();
+    }
+
+    private static boolean isExactMatch(Method method, Object[] args) {
+        Class<?>[] types = method.getParameterTypes();
+
+        if (types.length != args.length) {
+            return false;
+        }
+
+        for (int i = 0; i < types.length; i++) {
+            Object arg = args[i];
+            if (arg == null || arg.getClass() != types[i]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static boolean isCompatibleMatch(Method method, Object[] args) {
+        Class<?>[] types = method.getParameterTypes();
+
+        if (types.length != args.length) {
+            return false;
+        }
+
+        for (int i = 0; i < types.length; i++) {
+            if (!isInstanceOf(types[i], args[i])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public static Class<?> getPrimitiveWrapper(Class<?> type) {
+        if (type == byte.class) return Byte.class;
+        if (type == short.class) return Short.class;
+        if (type == int.class) return Integer.class;
+        if (type == long.class) return Long.class;
+        if (type == float.class) return Float.class;
+        if (type == double.class) return Double.class;
+        if (type == boolean.class) return Boolean.class;
+        if (type == char.class) return Character.class;
+        return type;
+    }
+
+    public static boolean isInstanceOf(Class<?> type, Object value) {
+        if (value == null) {
+            return !type.isPrimitive();
+        }
+
+        if (type.isPrimitive()) {
+            return getPrimitiveWrapper(type).isInstance(value);
+        }
+
+        return type.isInstance(value);
+    }
+
+    private static AccessorException propagateTargetException(String message, InvocationTargetException exception) {
+        Throwable cause = exception.getCause();
+
+        if (cause instanceof RuntimeException runtimeException) {
+            throw runtimeException;
+        }
+
+        if (cause instanceof Error error) {
+            throw error;
+        }
+
+        return new AccessorException(message, cause);
+    }
+
+    public static class AccessorException extends RuntimeException {
+
+        public AccessorException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
-    /**
-     * 通过索引获取值
-     */
-    public static Object getIndex(Object target, Object[] indexes) {
-        if (target == null || indexes == null) {
-            throw new IllegalArgumentException("Object and index cannot be null");
-        }
+    private interface Property {
 
-        TypeMeta typeMeta = getTypeMeta(target.getClass());
-        try {
-            return typeMeta.getIndex(target, indexes);
-        } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Failed to get index", e);
+        void set(Object target, Object value);
+
+        Object get(Object target);
+
+        default void assertInstanceOf(Class<?> type, Object value) {
+            if (!isInstanceOf(type, value)) {
+                String actual = Optional.ofNullable(value).map(Object::getClass).map(Class::getName).orElse("null");
+                throw new IllegalArgumentException("Expected " + type.getName() + ", but got " + actual);
+            }
         }
     }
 
-    static class TypeMeta {
+    private record FieldProperty(Field field) implements Property {
 
-        private static final Map<Class<?>, Class<?>> BOX = Map.of(
-                byte.class, Byte.class,
-                short.class, Short.class,
-                int.class, Integer.class,
-                long.class, Long.class,
-                float.class, Float.class,
-                double.class, Double.class,
-                boolean.class, Boolean.class,
-                char.class, CharClass.class
-        );
+        @Override
+        public void set(Object target, Object value) {
+            assertInstanceOf(field.getType(), value);
 
-        private final Map<String, PropertyDescriptor> properties;
-        private final Map<String, Field> fields;
-        private final Set<Method> indexSetters;
-        private final Set<Method> indexGetters;
-
-        TypeMeta(Class<?> clazz) {
-            this.properties = getProperties(clazz);
-            this.fields = getFields(clazz);
-            this.indexSetters = getIndexSetters(clazz);
-            this.indexGetters = getIndexGetters(clazz);
-        }
-
-        private Map<String, PropertyDescriptor> getProperties(Class<?> c) {
-            Map<String, PropertyDescriptor> map = new HashMap<>();
             try {
-                BeanInfo beanInfo = Introspector.getBeanInfo(c, Object.class);
-                for (PropertyDescriptor pd : beanInfo.getPropertyDescriptors()) {
-                    map.put(pd.getName(), pd);
-                }
-            } catch (IntrospectionException e) {
-                throw new RuntimeException("Failed to introspect class: " + c.getName(), e);
-            }
-            return map;
-        }
-
-        private Map<String, Field> getFields(Class<?> clazz) {
-            return Arrays.stream(clazz.getFields()).collect(Collectors.toMap(Field::getName, Function.identity()));
-        }
-
-        private Set<Method> getIndexSetters(Class<?> clazz) {
-            return Arrays.stream(clazz.getMethods()).filter(m -> SET_METHOD.equals(m.getName())).collect(Collectors.toSet());
-        }
-
-        private Set<Method> getIndexGetters(Class<?> clazz) {
-            return Arrays.stream(clazz.getMethods()).filter(m -> GET_METHOD.equals(m.getName())).collect(Collectors.toSet());
-        }
-
-        private boolean isInstance(Class<?> clazz, Object value) {
-            if (clazz.isPrimitive()) {
-                if (value == null) return false;
-                return BOX.get(clazz).isInstance(value);
-            }
-            return clazz.isInstance(value);
-        }
-
-        public void setProperty(Object target, String name, Object value) throws ReflectiveOperationException {
-            Field field = fields.get(name);
-            // 1. 尝试直接访问公共字段
-            if (field != null && isInstance(field.getType(), value)) {
                 field.set(target, value);
-                return;
+            } catch (Exception e) {
+                throw new AccessorException("Failed to set field: " + field.getName(), e);
             }
-
-            // 2. 使用内省机制查找 setter
-            PropertyDescriptor pd = properties.get(name);
-            if (pd != null && pd.getWriteMethod() != null && isInstance(pd.getPropertyType(), value)) {
-                Method setter = pd.getWriteMethod();
-                setter.invoke(target, value);
-                return;
-            }
-
-            // 没有找到合适的属性
-            throw new IllegalArgumentException("No accessible field or setter found for property: " + name);
         }
 
-        public Object getProperty(Object target, String name) throws ReflectiveOperationException {
-            Field field = fields.get(name);
-            if (field != null) {
+        @Override
+        public Object get(Object target) {
+            try {
                 return field.get(target);
+            } catch (IllegalAccessException e) {
+                throw new AccessorException("Failed to get field: " + field.getName(), e);
+            }
+        }
+    }
+
+    private record MethodProperty(PropertyDescriptor property) implements Property {
+
+        @Override
+        public void set(Object target, Object value) {
+            Method setter = property.getWriteMethod();
+
+            if (setter == null) {
+                throw new IllegalArgumentException("Property does not support write: " + property.getName());
             }
 
-            PropertyDescriptor pd = properties.get(name);
-            if (pd != null && pd.getReadMethod() != null) {
-                return pd.getReadMethod().invoke(target);
-            }
+            assertInstanceOf(setter.getParameterTypes()[0], value);
 
-            throw new IllegalArgumentException("No accessible field or getter found for property: " + name);
+            try {
+                setter.invoke(target, value);
+            } catch (InvocationTargetException e) {
+                throw propagateTargetException("Failed to set property: " + property.getName(), e);
+            } catch (ReflectiveOperationException e) {
+                throw new AccessorException("Failed to set property: " + property.getName(), e);
+            }
         }
 
-        public void setIndex(Object target, Object[] indexes, Object value) throws ReflectiveOperationException {
-            // 找到候选方法
-            List<Method> setters = indexSetters.stream().filter(m -> m.getParameterCount() == indexes.length + 1).filter(m -> {
-                Class<?>[] types = m.getParameterTypes();
-                for (int i = 0; i < indexes.length; i++) {
-                    if (!isInstance(types[i], indexes[i])) {
-                        return false;
-                    }
-                }
-                return isInstance(types[indexes.length], value);
-            }).toList();
-            // 没找到或者找到多个方法
-            if (setters.isEmpty()) {
-                throw new IllegalArgumentException("No suitable set method found");
-            }
-            if (setters.size() > 1) {
-                throw new IllegalArgumentException("More than one suitable set method found");
-            }
-            // 执行方法
-            Object[] args = Arrays.copyOf(indexes, indexes.length + 1);
-            args[indexes.length] = value;
-            setters.get(0).invoke(target, args);
-        }
+        @Override
+        public Object get(Object target) {
+            Method getter = property.getReadMethod();
 
-        public Object getIndex(Object target, Object[] indexes) throws ReflectiveOperationException {
-            // 找到候选方法
-            List<Method> getters = indexGetters.stream().filter(m -> m.getParameterCount() == indexes.length).filter(m -> {
-                Class<?>[] types = m.getParameterTypes();
-                for (int i = 0; i < indexes.length; i++) {
-                    if (!isInstance(types[i], indexes[i])) {
-                        return false;
-                    }
-                }
-                return true;
-            }).toList();
-            // 没找到或者找到多个方法
-            if (getters.isEmpty()) {
-                throw new IllegalArgumentException("No suitable get method found");
+            if (getter == null) {
+                throw new IllegalArgumentException("Property does not support read: " + property.getName());
             }
-            if (getters.size() > 1) {
-                throw new IllegalArgumentException("More than one suitable get method found");
+
+            try {
+                return getter.invoke(target);
+            } catch (InvocationTargetException e) {
+                throw propagateTargetException("Failed to get property: " + property.getName(), e);
+            } catch (ReflectiveOperationException e) {
+                throw new AccessorException("Failed to get property: " + property.getName(), e);
             }
-            // 执行方法
-            return getters.get(0).invoke(target, indexes);
         }
     }
 }

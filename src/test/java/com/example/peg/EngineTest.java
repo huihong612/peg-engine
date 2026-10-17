@@ -89,14 +89,30 @@ class EngineTest {
     }
 
     @Test
+    void calc2() {
+        String g = """
+                expr    = { var this = load('com.example.peg.Calc') } sum { slot['op'] = value() }
+                sum     = product ('+' product { add() } / '-' product { sub() })*
+                product = unary ('*' unary { mul() } / '/' unary { div() })*
+                unary   = '+' unary / '-' unary { negate() } / primary
+                primary = number / '(' sum ')'
+                number  = (?<v>[0-9]+ ('.' [0-9]+)?) { push(v) }
+                """;
+        PEGMatcher matcher = PEGPattern.compile(g).matcher("1.5+2.5");
+        assertTrue(matcher.matches());
+        assertEquals(new BigDecimal("4.0"), matcher.slot("op"));
+    }
+
+
+    @Test
     void calc() {
         String g = """
-                expr    = { var op = list() } sum { slot['op'] = op }
-                sum     = product ('+' product { op.push('add') } / '-' product { op.push('sub') })*
-                product = unary ('*' unary { op.push('mul') } / '/' unary { op.push('div') })*
-                unary   = '+' unary / '-' unary { op.push('not') } / primary
+                expr    = { var this = list() } sum { slot['op'] = this }
+                sum     = product ('+' product { push('add') } / '-' product { push('sub') })*
+                product = unary ('*' unary { push('mul') } / '/' unary { push('div') })*
+                unary   = '+' unary / '-' unary { push('not') } / primary
                 primary = number / '(' sum ')'
-                number  = (?<v>[0-9]+ ('.' [0-9]+)?) { op.push(v) }
+                number  = (?<v>[0-9]+ ('.' [0-9]+)?) { push(v) }
                 """;
         PEGMatcher matcher = PEGPattern.compile(g).matcher("1.5+2.5");
         assertTrue(matcher.matches());

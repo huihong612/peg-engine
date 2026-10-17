@@ -1,5 +1,9 @@
 package com.example.peg;
 
+import com.example.peg.eval.Array;
+import com.example.peg.eval.Dictionary;
+import com.example.peg.eval.Eval;
+
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -49,7 +53,7 @@ final class Context implements PEGContext {
     int pos;
     Scope scope;
     Object returnValue;
-    final Dictionary slots = new Dictionary();
+    final com.example.peg.eval.Dictionary slots = new com.example.peg.eval.Dictionary();
     final Deque<Undo> undo = new ArrayDeque<>();
     final Map<String, Expr> rules;
     final Deque<String> ruleStack = new ArrayDeque<>();
@@ -266,8 +270,12 @@ record Capture(String name, Expr e, boolean out) implements Expr {
 
 abstract class Action implements Expr {
     public Result eval(Context c) {
-        var ret = run(c);
-        return Result.ok(c, ret);
+        try {
+            var ret = run(c);
+            return Result.ok(c, ret);
+        } catch (Exception e) {
+            return Result.fail(c);
+        }
     }
 
     abstract Object run(Context c);
@@ -289,7 +297,24 @@ final class VarAction extends Action {
             case "dict" -> new Dictionary();
             case "list" -> new Array();
             case "eval" -> new Eval((String) args.getFirst().eval(c).value());
-            default -> throw new IllegalArgumentException("Undefined variable: " + kind);
+            case "load" -> {
+                String typeName = (String) args.getFirst().eval(c).value();
+                try {
+                    Class<?> type = Class.forName(typeName);
+                    if (!Invokable.class.isAssignableFrom(type)) {
+                        throw new GrammarCompileException("Type " + typeName + " is not a subclass of " + Invokable.class.getName());
+                    }
+                    yield type.getConstructor().newInstance();
+                } catch (ClassNotFoundException e) {
+                    throw new IllegalArgumentException(e);
+                } catch (ReflectiveOperationException e) {
+                    throw new IllegalArgumentException("Invokable create failed: " + typeName, e);
+                }
+            }
+            default -> {
+                c.error(Set.of("dict", "list", "eval", "load"));
+                throw new IllegalArgumentException("Undefined variable: " + kind);
+            }
         };
         c.bind(n, v);
         return null;
@@ -301,7 +326,6 @@ record NameValue(String n) implements Expr {
         return Result.ok(c, c.get(n));
     }
 }
-
 record ConstExpr(Object v) implements Expr {
     public Result eval(Context c) {
         return Result.ok(c, v);
@@ -461,7 +485,7 @@ final class GrammarParser {
             skip();
             if (match("?<")) {
                 skip();
-                boolean out = match("out");
+                boolean out = match("out") || match("ret");
                 String n = ident();
                 skip();
                 expect('>');
@@ -535,6 +559,11 @@ final class GrammarParser {
             }
             throw new GrammarCompileException("Only indexed assignment supported");
         }
+        // <ident> (args)
+        if (peek('(')) {
+            List<Expr> args = args();
+            return new MethodAction(new NameValue("this"), lhs, args);
+        }
         // <ident> . <ident> ( <args> )
         // <ident> . <ident> = <actionExpr>
         if (match(".")) {
@@ -597,6 +626,11 @@ final class GrammarParser {
             } else {
                 return new MethodAction(new NameValue(n), ":" + method, Collections.emptyList());
             }
+        }
+        // <ident> (args)
+        if (peek('(')) {
+            List<Expr> args = args();
+            return new MethodAction(new NameValue("this"), n, args);
         }
         // 对象索引
         if (match("[")) {
